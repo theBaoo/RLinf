@@ -313,6 +313,47 @@ def get_model(model_path, cfg: DictConfig, override_config_kwargs=None):
 
         if cfg.rl_head_config.disable_dropout:
             replace_dropout_with_identity(model)
+    elif cfg.model_name == "smolvla":
+        # TODO: DataConfig; setup wrappers
+        from .embodiment.smolvla_action_model import SmolVLAForRLActionPrediction, SmolVLAForRLConfig
+        from lerobot.policies.factory import make_pre_post_processors
+
+        simulator_type = getattr(cfg.smolvla, "simulator_type", "libero")
+        if simulator_type == "libero":
+            actor_train_config = SmolVLAForRLConfig()
+        actor_model_config = actor_train_config
+
+        huggingface_cache_path = "/root/.cache/huggingface/hub"
+        ckpt_path = os.path.join(
+            huggingface_cache_path,
+            "models--HuggingFaceVLA--smolvla_libero/snapshots/6721902bc4d61e50a3bfdb11dfb4cb626f05d102",
+        )
+        weight_path = os.path.join(
+            ckpt_path,
+            "model.safetensors",
+        )
+
+        dataset_stats = {
+            "observation.state": {"mean": torch.zeros(14), "std": torch.ones(14)},
+            "action": {"mean": torch.zeros(7), "std": torch.ones(7)},
+            "observation.images.base_0_rgb": {"mean": torch.zeros(3, 224, 224), "std": torch.ones(3, 224, 224)},
+        }
+        preprocessor, postprocessor = make_pre_post_processors(
+            policy_cfg=actor_model_config,
+            pretrained_path=None,
+            dataset_stats=dataset_stats
+        )
+
+        model = SmolVLAForRLActionPrediction(actor_model_config)
+        model.setup_processor(
+            preprocessor,
+            postprocessor
+        )
+
+        if actor_model_config.train_expert_only:
+            model.freeze_vlm()
+
+        safetensors.torch.load_model(model, weight_path, strict=False)
     else:
         return None
     if torch.cuda.is_available():
