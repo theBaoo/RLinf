@@ -24,11 +24,12 @@ from transformers import (
     AutoTokenizer,
 )
 
-from rlinf.config import torch_dtype_from_precision
+from rlinf.config import SupportedModel, get_supported_model, torch_dtype_from_precision
 
 
 def get_vla_model_config_and_processor(cfg: DictConfig):
-    if cfg.model.model_name == "openvla":
+    model_type = get_supported_model(cfg.model.model_type)
+    if model_type == SupportedModel.OPENVLA:
         from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 
         from .embodiment.prismatic.processing_prismatic import (
@@ -63,7 +64,7 @@ def get_vla_model_config_and_processor(cfg: DictConfig):
             image_processor=image_processor,
             trust_remote_code=True,
         )
-    elif cfg.model.model_name == "openvla_oft":
+    elif model_type == SupportedModel.OPENVLA_OFT:
         from prismatic.extern.hf.configuration_prismatic import (
             OpenVLAConfig as OpenVLAOFTConfig,
         )
@@ -96,9 +97,11 @@ def get_vla_model_config_and_processor(cfg: DictConfig):
     return model_config, input_processor
 
 
-def get_model(model_path, cfg: DictConfig, override_config_kwargs=None):
+def get_model(cfg: DictConfig, override_config_kwargs=None):
+    model_path = cfg.model_path
     torch_dtype = torch_dtype_from_precision(cfg.precision)
-    if cfg.model_name == "openvla":
+    model_type = get_supported_model(cfg.model_type)
+    if model_type == SupportedModel.OPENVLA:
         from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 
         actor_model_config = OpenVLAConfig.from_pretrained(
@@ -131,7 +134,7 @@ def get_model(model_path, cfg: DictConfig, override_config_kwargs=None):
 
         model.to(torch_dtype)
 
-    elif cfg.model_name == "openvla_oft":
+    elif model_type == SupportedModel.OPENVLA_OFT:
         from prismatic.extern.hf.configuration_prismatic import (
             OpenVLAConfig as OpenVLAOFTConfig,
         )
@@ -172,7 +175,9 @@ def get_model(model_path, cfg: DictConfig, override_config_kwargs=None):
 
         model.to(torch_dtype)
 
-    elif cfg.model_name == "openpi":
+    elif model_type == SupportedModel.OPENPI:
+        import glob
+
         import openpi.shared.download as download
         import openpi.transforms as transforms
         import safetensors
@@ -195,14 +200,19 @@ def get_model(model_path, cfg: DictConfig, override_config_kwargs=None):
                 actor_model_config.__dict__[key] = val
         # load model
         checkpoint_dir = download.maybe_download(str(model_path))
-        weight_path = os.path.join(checkpoint_dir, "model.safetensors")
+        weight_paths = sorted(glob.glob(os.path.join(checkpoint_dir, "*.safetensors")))
+        if not weight_paths:
+            weight_paths = [os.path.join(checkpoint_dir, "model.safetensors")]
+
         model: OpenPi0ForRLActionPrediction = OpenPi0ForRLActionPrediction(
             actor_model_config
         )
         # train expert only
         if actor_model_config.train_expert_only:
             model.freeze_vlm()
-        safetensors.torch.load_model(model, weight_path, strict=False)
+
+        for weight_path in weight_paths:
+            safetensors.torch.load_model(model, weight_path, strict=False)
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
         # fsdp replace
         # model.paligemma_with_expert.replace_gemma_decoder_layers()
@@ -242,7 +252,7 @@ def get_model(model_path, cfg: DictConfig, override_config_kwargs=None):
             ],
         )
 
-    elif cfg.model_name == "mlp_policy":
+    elif model_type == SupportedModel.MLP_POLICY:
         from .embodiment.mlp_policy import MLPPolicy
 
         model = MLPPolicy(
@@ -252,7 +262,7 @@ def get_model(model_path, cfg: DictConfig, override_config_kwargs=None):
             num_action_chunks=cfg.num_action_chunks,
             add_value_head=cfg.add_value_head,
         )
-    elif cfg.model_name == "gr00t":
+    elif model_type == SupportedModel.GR00T:
         from pathlib import Path
 
         from rlinf.utils.patcher import Patcher
@@ -316,33 +326,67 @@ def get_model(model_path, cfg: DictConfig, override_config_kwargs=None):
     elif cfg.model_name == "smolvla":
         # TODO: DataConfig; setup wrappers
         from .embodiment.smolvla_action_model import SmolVLAForRLActionPrediction, SmolVLAForRLConfig
-        from lerobot.policies.factory import make_pre_post_processors
+        from lerobot.policies.factory import make_pre_post_processors, make_policy
+        from lerobot.configs.types import FeatureType, PolicyFeature
+        import safetensors
+        from collections import OrderedDict
+        from rlinf.utils.logging import get_logger
+        logger = get_logger()
 
         simulator_type = getattr(cfg.smolvla, "simulator_type", "libero")
         if simulator_type == "libero":
             actor_train_config = SmolVLAForRLConfig()
         actor_model_config = actor_train_config
+        actor_model_config.load_vlm_weights = True
+        actor_model_config.pretrained_path = 'HuggingFaceVLA/smolvla_libero'
+        actor_model_config.expert_width_multiplier = 0.5
 
-        huggingface_cache_path = "/root/.cache/huggingface/hub"
-        ckpt_path = os.path.join(
-            huggingface_cache_path,
-            "models--HuggingFaceVLA--smolvla_libero/snapshots/6721902bc4d61e50a3bfdb11dfb4cb626f05d102",
-        )
-        weight_path = os.path.join(
-            ckpt_path,
-            "model.safetensors",
-        )
+        # actor_model_config.num_steps = 5
+        # actor_model_config.chunk_size = 5
+        # actor_model_config.n_action_steps = 5
+
+        # hard coding, to be removed soon
+        # actor_model_config.input_features = {
+        #     # from 14 to 8
+        #     "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(8,)),
+        #     "observation.images.base_0_rgb": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 256, 256)),
+        # }
+        # actor_model_config.output_features = {
+        #     "action": PolicyFeature(type=FeatureType.ACTION, shape=(7,)),
+        # }
+        actor_model_config.input_features = {
+            'observation.images.image': PolicyFeature(type=FeatureType.VISUAL, shape=(3, 256, 256)),
+            'observation.images.image2': PolicyFeature(type=FeatureType.VISUAL, shape=(3, 256, 256)),
+            'observation.state': PolicyFeature(type=FeatureType.STATE, shape=(8,)),
+        }
+        actor_model_config.output_features = {
+            'action': PolicyFeature(type=FeatureType.ACTION, shape=(7,)),
+        }
 
         dataset_stats = {
-            "observation.state": {"mean": torch.zeros(14), "std": torch.ones(14)},
-            "action": {"mean": torch.zeros(7), "std": torch.ones(7)},
-            "observation.images.base_0_rgb": {"mean": torch.zeros(3, 224, 224), "std": torch.ones(3, 224, 224)},
+            # from 14 to 8
+            # "observation.state": {"mean": torch.zeros(8), "std": torch.ones(8)},
+            # "action": {"mean": torch.zeros(7), "std": torch.ones(7)},
+            # "observation.images.base_0_rgb": {"mean": torch.zeros(3, 224, 224), "std": torch.ones(3, 224, 224)},
         }
         preprocessor, postprocessor = make_pre_post_processors(
             policy_cfg=actor_model_config,
-            pretrained_path=None,
+            pretrained_path="HuggingFaceVLA/smolvla_libero",
             dataset_stats=dataset_stats
         )
+
+        # logger.info(f"Using SmolVLA actor_train_config: {actor_train_config}")
+
+        # test load policy
+        # pass
+        # from lerobot.policies.factory import get_policy_class
+        # cls = get_policy_class("smolvla")
+        # kwargs = {}
+        # kwargs["config"] = actor_model_config
+        # kwargs["pretrained_name_or_path"] = "HuggingFaceVLA/smolvla_libero"
+        # policy = cls.from_pretrained(**kwargs)
+        # for k, v in policy.state_dict().items():
+        #     logger.info(f"SmolVLA policy state_dict key: {k}, shape: {v.shape}")
 
         model = SmolVLAForRLActionPrediction(actor_model_config)
         model.setup_processor(
@@ -353,7 +397,29 @@ def get_model(model_path, cfg: DictConfig, override_config_kwargs=None):
         if actor_model_config.train_expert_only:
             model.freeze_vlm()
 
-        safetensors.torch.load_model(model, weight_path, strict=False)
+        ckpt_path = "/home/bao_zonghuang/.cache/huggingface/hub/models--HuggingFaceVLA--smolvla_libero/snapshots/6721902bc4d61e50a3bfdb11dfb4cb626f05d102"
+        weight_path = os.path.join(ckpt_path, "model.safetensors")
+        # safetensors.torch.load_model(model, weight_path, strict=False)
+        
+        # logger.info(f"SmolVLA model keys: {model.state_dict().keys()}")
+        # logger.info(f"ckpt keys: {safetensors.torch.load_file(weight_path).keys()}")
+        ckpt = safetensors.torch.load_file(weight_path)
+        model_dict = model.state_dict()
+        new_ckpt = OrderedDict()
+        mismatched_keys = []
+        prefix = "model."
+        for k, t in ckpt.items():
+            new_k = k[len(prefix):] if k.startswith(prefix) else k
+            if new_k in model_dict:
+                new_ckpt[new_k] = t.clone()  # clone 以防后续 in-place
+            else:
+                # 如果你想追踪未匹配的 ckpt key，可以打印或收集
+                mismatched_keys.append(new_k)
+        if len(mismatched_keys) > 0:
+            pass
+            # logger.warning(f"以下 ckpt keys 未匹配到模型参数: {mismatched_keys}")
+        res = model.load_state_dict(new_ckpt, strict=False)
+        # logger.info(f"SmolVLA load_state_dict result: {res}")
     else:
         return None
     if torch.cuda.is_available():
@@ -387,7 +453,7 @@ def get_model(model_path, cfg: DictConfig, override_config_kwargs=None):
                 ],
                 init_lora_weights="gaussian",
             )
-            if cfg.model_name == "openpi":
+            if model_type == SupportedModel.OPENPI:
                 module_to_lora = model.paligemma_with_expert.paligemma
                 module_to_lora = get_peft_model(module_to_lora, lora_config)
                 tag_vlm_subtree(model, False)
@@ -402,9 +468,6 @@ def get_model(model_path, cfg: DictConfig, override_config_kwargs=None):
             for param in model.value_head.parameters():
                 param.requires_grad = True
 
-    if hasattr(cfg, "ckpt_path") and cfg.ckpt_path is not None:
-        model_dict = torch.load(cfg.ckpt_path)
-        model.load_state_dict(model_dict)
     return model
 
 

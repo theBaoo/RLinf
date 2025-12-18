@@ -3,6 +3,7 @@ from typing import Literal, Any
 from typing_extensions import Unpack
 import numpy as np
 from collections.abc import Sequence
+from collections import deque
 import torch
 import random
 
@@ -12,6 +13,43 @@ from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LAN
 
 from rlinf.models.embodiment.modules.explore_noise_net import ExploreNoiseNet
 from rlinf.models.embodiment.modules.value_head import ValueHead
+from rlinf.utils.logging import get_logger
+
+
+def _log_shapes(obj, logger, name="root"):
+    """Recursively log keys and shapes/types for dict/list/torch/ndarray objects.
+
+    Keeps output small: prints type and shape/length only.
+    """
+    try:
+        import numpy as _np
+    except Exception:
+        _np = None
+
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            _log_shapes(v, logger, f"{name}.{k}")
+    elif isinstance(obj, (list, tuple)):
+        logger.info(f"{name}: {type(obj).__name__} len={len(obj)}")
+        for i, v in enumerate(obj[:10]):
+            _log_shapes(v, logger, f"{name}[{i}]")
+        if len(obj) > 10:
+            logger.info(f"{name}: ... (showing first 10 of {len(obj)})")
+    elif 'torch' in globals() and torch.is_tensor(obj):
+        try:
+            logger.info(f"{name}: Tensor shape={tuple(obj.shape)} dtype={obj.dtype} device={obj.device}")
+        except Exception:
+            logger.info(f"{name}: Tensor (unable to read shape)")
+    elif _np is not None and isinstance(obj, _np.ndarray):
+        logger.info(f"{name}: ndarray shape={obj.shape} dtype={obj.dtype}")
+    else:
+        # fallback for scalars / other objects
+        tname = type(obj).__name__
+        # avoid printing large reprs
+        short = repr(obj)
+        if len(short) > 200:
+            short = short[:200] + "..."
+        logger.info(f"{name}: {tname} repr={short}")
 
 @dataclass
 class SmolVLAForRLConfig(SmolVLAConfig):
@@ -61,9 +99,9 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
             assert not (self.config.double_layer and self.config.joint_logprob), (
                 "double_layer and joint_logprob can not be set at the same time"
             )
-            proj_width = 2048
+            proj_width = 480 # smolvla, 720 to 480
         else:
-            proj_width = 1024
+            proj_width = 480 # smolvla
 
         self.global_step = 0
 
@@ -89,6 +127,11 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
                 noise_logvar_range=[0.08, 0.16],
                 noise_scheduler_type="learn",
             )
+
+        # store action chunks
+        self._queues = {
+            ACTION: deque(maxlen=self.config.n_action_steps),
+        }
 
     def set_global_step(self, step):
         self.global_step = step
@@ -121,13 +164,34 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
             "task": ["Pick up the object"],
         }
         """
+        # logger = get_logger()
+        # logger.info("--- debug: env_obs shapes ---")
+        # _log_shapes(env_obs, logger, "env_obs")
+        
         to_processed_obs = {
             "observation.state": env_obs["states"],
-            "observation.images.base_0_rgb": env_obs["images"],
-            "task": [env_obs["task_descriptions"]]
+            # "observation.images.base_0_rgb": env_obs["images"],
+            "observation.images.image": env_obs["images"],
+            "observation.images.image2": env_obs["wrist_images"],
+            "task": env_obs["task_descriptions"]
         }
-        # TODO: 移植SmolVLA's preprocessor
+        # logger.info("--- debug: to_processed_obs shapes ---")
+        # _log_shapes(to_processed_obs, logger, "to_processed_obs")
+
+        # RLinf does the same
+        # LiberoProcessorStep in lerobot:
+        # image = to_processed_obs["observation.images.image"]
+        # image = torch.flip(image, dims=[2, 3])
+        # to_processed_obs["observation.images.image"] = image
+
+        wrist_image = to_processed_obs["observation.images.image2"]
+        wrist_image = torch.flip(wrist_image, dims=[2, 3])
+        to_processed_obs["observation.images.image2"] = wrist_image
+
         processed_obs = self.preprocessor(to_processed_obs)
+
+        # logger.info("--- debug: processed_obs shapes ---")
+        # _log_shapes(processed_obs, logger, "processed_obs")
         # ignore self.config.adapt_to_pi_aloha
         return processed_obs
 
@@ -161,6 +225,9 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
         # Preprocess image features present in the batch
         for key in present_img_keys:
             img = batch[key][:, -1, :, :, :] if batch[key].ndim == 5 else batch[key]
+            # ensure image tensor is float in [0, 1] before interpolation/resizing
+            if not torch.is_floating_point(img):
+                img = img.float()
             if self.config.resize_imgs_with_padding is not None:
                 img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
 
@@ -254,40 +321,74 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
         }
 
     @torch.no_grad()
-    def predict_batch_action(
+    def predict_action_batch(
         self,
         env_obs,
         mode: Literal["train", "eval"] = "train",
         compute_values=True,
+        **kwargs, # Why there is 'temperature'?
     ) -> tuple[np.ndarray, dict[str, Any]]:
-        # get batch in SmolVLA
+        # if len(self._queues[ACTION]) == 0:
         processed_obs = self.input_processor(env_obs)
-
         images, img_masks = self.prepare_images(processed_obs)
         lang_tokens = processed_obs[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = processed_obs[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         state = self.prepare_state(processed_obs)
+        # call sample_actions with keyword args so positional 'mode' is not interpreted as 'noise'
         outputs = self.sample_actions(
             images,
             img_masks,
             lang_tokens,
             lang_masks,
             state,
-            mode
+            mode=mode,
+            compute_values=compute_values,
+            **kwargs,
         )
-        actions = self.postprocessor(outputs["actions"])
+
+        # unpad actions
+        actions = outputs["actions"]
+        # actions = outputs
+
+        # logger.info("--- debug: raw chunk actions shapes ---")
+        # _log_shapes(actions, logger, "raw chunk actions")
+
+        original_action_dim = self.config.action_feature.shape[0]
+        actions = actions[:, :, :original_action_dim]
+
+        # logger.info("--- debug: unpad chunk actions shapes ---")
+        # _log_shapes(actions, logger, "unpad chunk actions")
+
+        # actions = actions.transpose(0, 1)[: self.config.n_action_steps]
+        # self._queues[ACTION].extend(actions.transpose(0, 1)[: self.config.n_action_steps])
+
+        # actions = self._queues[ACTION].popleft()
+
+        # actions: [bsize, chunk_size, action_dim]
+        # actions = self.postprocessor(actions)
+        post_actions = []
+        for i in range(actions.shape[1]):
+            chunk = actions[:, i, :]
+            pa = self.postprocessor(chunk)
+            post_actions.append(pa)
+        actions = torch.stack(post_actions, dim=1)
+        # actions = actions.transpose(0, 1)[: self.config.n_action_steps]
+        # logger.info("--- debug: postprocessed actions shapes ---")
+        # _log_shapes(actions, logger, "postprocessed actions")
+        # logger.info(f"actions: {actions}")
 
         # 字段命名?
         forward_inputs = {
             "chains": outputs["chains"],
             "denoise_inds": outputs["denoise_inds"],
-            "observations/image": env_obs["image"],
-            "observations/state": env_obs["state"],
-            "tokenized_prompt": processed_obs["tokenized_prompt"],
-            "tokenized_prompt_mask": processed_obs["tokenized_prompt_mask"],
+            # "observations/image": env_obs["images"],
+            # "observations/state": env_obs["states"],
+            # "tokenized_prompt": processed_obs["tokenized_prompt"],
+            # "tokenized_prompt_mask": processed_obs["tokenized_prompt_mask"],
         }
         if self.config.simulator_type == "libero":
-            forward_inputs["observations/wrist_image"] = env_obs["wrist_image"]
+            # forward_inputs["observations/wrist_image"] = env_obs["wrist_images"]
+            pass
 
         result = {
             "prev_logprobs": outputs["prev_logprobs"],
@@ -301,7 +402,7 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
     SmolVLA: 直接传入img等信息
     """
     @torch.no_grad()
-    def sample_action(
+    def sample_actions(
         self,
         images,
         img_masks,
@@ -311,7 +412,7 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
         noise=None,
         mode="train",
         compute_values=True,
-        # **kwargs: Unpack[ActionSelectKwargs], used for real time chunk
+        **kwargs, # temperature???
     ):
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = state.shape[0]
@@ -375,27 +476,19 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
         for idx in range(num_steps):
             # sample mean var val
             if idx == denoise_inds[0][idx]:
-                x_t_mean, x_t_std, value_t = self.sample_mean_var_val(
-                    x_t,
-                    idx,
-                    state,
-                    prefix_pad_masks,
-                    past_key_values,
-                    "train",
-                    num_steps,
-                    compute_values,
-                )
+                sample_mode = "train"
             else:
-                x_t_mean, x_t_std, value_t = self.sample_mean_var_val(
-                    x_t,
-                    denoise_inds[0][idx],
-                    state,
-                    prefix_pad_masks,
-                    past_key_values,
-                    "eval",
-                    num_steps,
-                    compute_values,
-                )
+                sample_mode = "eval"
+            x_t_mean, x_t_std, value_t = self.sample_mean_var_val(
+                x_t,
+                idx,
+                state,
+                prefix_pad_masks,
+                past_key_values,
+                sample_mode,
+                num_steps,
+                compute_values,
+            )
             # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t_mean + self.sample_noise(x_t.shape, device) * x_t_std
             log_prob = self.get_logprob_norm(
@@ -407,11 +500,21 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
             values.append(value_t)
             chains.append(x_t)
             log_probs.append(log_prob)
+
         x_0 = x_t
         chains = torch.stack(chains, dim=1)
         log_probs = torch.stack(log_probs, dim=1)[
             :, :, : self.config.chunk_size, : self.config.action_env_dim
         ]
+
+        if self.config.joint_logprob:
+            log_probs = log_probs.mean(dim=1)
+        else:
+            log_probs = log_probs[
+                torch.arange(log_probs.shape[0]),
+                denoise_inds[:, 0],
+            ]
+
         if self.use_vlm_value:
             values = values_vlm[:, None]
         else:
@@ -505,7 +608,7 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
         if mode == "eval":
             x0_weight = 1 - (t_input - delta)
             x1_weight = t_input - delta
-            x_t_std = torch.zeros
+            x_t_std = torch.zeros_like(t_input)
         elif mode == "train":
             if self.config.noise_method == "reinflow":
                 x0_weight = 1 - (t_input - delta)
@@ -534,6 +637,37 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
         """
 
         # openpi's 额外传入state, 额外返回adarms_cond
+        # Normalize `timestep` to a 1D float tensor of shape (batch_size,) as
+        # expected by create_sinusoidal_pos_embedding. Accepts:
+        # - Python scalar (int/float)
+        # - 0-dim tensor
+        # - 1-dim tensor of length batch_size
+        # - higher-dim tensor that can be squeezed/reshaped to (batch_size,)
+        batch_size = prefix_pad_masks.shape[0]
+        device = state.device if torch.is_tensor(state) else None
+
+        if not torch.is_tensor(timestep):
+            # scalar or python object -> fill batch
+            try:
+                tval = float(timestep)
+            except Exception:
+                tval = 0.0
+            timestep = torch.full((batch_size,), tval, dtype=torch.float32, device=device)
+        else:
+            # coerce dtype/device and shape
+            timestep = timestep.to(device=device, dtype=torch.float32)
+            if timestep.ndim == 0:
+                timestep = timestep.expand(batch_size)
+            elif timestep.ndim == 1 and timestep.shape[0] == batch_size:
+                pass
+            else:
+                try:
+                    timestep = timestep.reshape(batch_size)
+                except Exception:
+                    timestep = timestep.squeeze()
+                    if timestep.ndim == 0:
+                        timestep = timestep.expand(batch_size)
+
         suffix_embs, suffix_pad_masks, suffix_att_masks = (
             self.embed_suffix(
                 x_t,
@@ -543,20 +677,23 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = suffix_pad_masks.shape[0]
-        prefix_len = suffix_pad_masks.shape[1]
+        # prefix_len should come from prefix_pad_masks passed into this function
+        prefix_len = prefix_pad_masks.shape[1]
 
-        prefix_pad_2d_masks = suffix_pad_masks[:, None, :].expand(
+        # build 2d mask of shape [B, suffix_len, prefix_len] from prefix_pad_masks
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(
             batch_size, suffix_len, prefix_len
         )
 
+        # make_att_2d_masks expects (pad_masks[B,N], att_masks[B,N]).
         suffix_att_2d_masks = make_att_2d_masks(
+            suffix_pad_masks,
             suffix_att_masks,
-            prefix_pad_2d_masks,
         )
 
         full_att_2d_masks = torch.cat(
             [prefix_pad_2d_masks, suffix_att_2d_masks],
-            dim=-2,
+            dim=2,
         )
 
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]

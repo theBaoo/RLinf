@@ -57,14 +57,22 @@ Algorithm
 
    - Compute the advantage of each action by subtracting the group's mean reward
 
-
 Dependency Installation
 -----------------------
 
-If you are using the Docker image, please pull the latest image via `docker pull` to get the required dependencies.
+**Option 1: Docker Image**
 
-If you have set up the environment manually, please run `uv pip install metaworld` to install the MetaWorld package along with its dependencies.
+Use the Docker image ``rlinf/rlinf:agentic-rlinf0.1-metaworld`` for the experiment.
 
+**Option 2: Custom Environment**
+
+Install dependencies directly in your environment by running the following command:
+
+.. code:: bash
+
+   pip install uv
+   bash requirements/install.sh embodied --model openpi --env metaworld
+   source .venv/bin/activate
 
 Model Download
 --------------

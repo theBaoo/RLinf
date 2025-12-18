@@ -26,6 +26,8 @@ runner:
   max_epochs: 1000
   max_steps: -1
 
+  only_eval: False
+
   val_check_interval: -1
   save_interval: 40
   seq_length: 4096
@@ -43,7 +45,7 @@ algorithm:
   reward_coef: 1.0
   n_chunk_steps: 48
   n_eval_chunk_steps: 48
-  num_group_envs: 1 # reduce, from 8 to 1
+  num_group_envs: 2 # reduce, from 8 to 2
   rollout_epoch: 8
   reward_type: chunk_level
   logprob_type: chunk_level
@@ -124,7 +126,7 @@ actor:
   model:
     model_name: "smolvla"
     precision: null
-    num_action_chunks: 10 # interface for the env
+    num_action_chunks: 50 # interface for the env, from 10 to 50 for aligning with smolvla
     action_dim: 7
     is_lora: False
     lora_rank: 32
