@@ -323,7 +323,7 @@ def get_model(cfg: DictConfig, override_config_kwargs=None):
 
         if cfg.rl_head_config.disable_dropout:
             replace_dropout_with_identity(model)
-    elif cfg.model_name == "smolvla":
+    elif model_type == SupportedModel.SMOLVLA:
         # TODO: DataConfig; setup wrappers
         from .embodiment.smolvla_action_model import SmolVLAForRLActionPrediction, SmolVLAForRLConfig
         from lerobot.policies.factory import make_pre_post_processors, make_policy
@@ -333,13 +333,16 @@ def get_model(cfg: DictConfig, override_config_kwargs=None):
         from rlinf.utils.logging import get_logger
         logger = get_logger()
 
-        simulator_type = getattr(cfg.smolvla, "simulator_type", "libero")
-        if simulator_type == "libero":
-            actor_train_config = SmolVLAForRLConfig()
+        
+        actor_train_config = SmolVLAForRLConfig()
         actor_model_config = actor_train_config
         actor_model_config.load_vlm_weights = True
         actor_model_config.pretrained_path = 'HuggingFaceVLA/smolvla_libero'
         actor_model_config.expert_width_multiplier = 0.5
+        actor_model_config.n_action_steps = 5
+        # 使用下面两条配置后, 可以完成eval
+        actor_model_config.num_vlm_layers = 0
+        actor_model_config.prefix_length = 0
 
         # actor_model_config.num_steps = 5
         # actor_model_config.chunk_size = 5
@@ -363,16 +366,9 @@ def get_model(cfg: DictConfig, override_config_kwargs=None):
             'action': PolicyFeature(type=FeatureType.ACTION, shape=(7,)),
         }
 
-        dataset_stats = {
-            # from 14 to 8
-            # "observation.state": {"mean": torch.zeros(8), "std": torch.ones(8)},
-            # "action": {"mean": torch.zeros(7), "std": torch.ones(7)},
-            # "observation.images.base_0_rgb": {"mean": torch.zeros(3, 224, 224), "std": torch.ones(3, 224, 224)},
-        }
         preprocessor, postprocessor = make_pre_post_processors(
             policy_cfg=actor_model_config,
             pretrained_path="HuggingFaceVLA/smolvla_libero",
-            dataset_stats=dataset_stats
         )
 
         # logger.info(f"Using SmolVLA actor_train_config: {actor_train_config}")

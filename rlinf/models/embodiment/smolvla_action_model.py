@@ -184,9 +184,16 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
         # image = torch.flip(image, dims=[2, 3])
         # to_processed_obs["observation.images.image"] = image
 
-        wrist_image = to_processed_obs["observation.images.image2"]
-        wrist_image = torch.flip(wrist_image, dims=[2, 3])
-        to_processed_obs["observation.images.image2"] = wrist_image
+        # lerobot: preprocess_observation
+        img = to_processed_obs["observation.images.image"]
+        img = img.type(torch.float32)
+        img /= 255
+        to_processed_obs["observation.images.image"] = img
+
+        wimg = to_processed_obs["observation.images.image2"]
+        wimg = wimg.type(torch.float32)
+        wimg /= 255
+        to_processed_obs["observation.images.image2"] = wimg
 
         processed_obs = self.preprocessor(to_processed_obs)
 
@@ -226,8 +233,8 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
         for key in present_img_keys:
             img = batch[key][:, -1, :, :, :] if batch[key].ndim == 5 else batch[key]
             # ensure image tensor is float in [0, 1] before interpolation/resizing
-            if not torch.is_floating_point(img):
-                img = img.float()
+            # img = img.type(torch.float32)
+            # img /= 255
             if self.config.resize_imgs_with_padding is not None:
                 img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
 
@@ -347,8 +354,8 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
         )
 
         # unpad actions
-        actions = outputs["actions"]
-        # actions = outputs
+        actions = outputs["actions"][:, : self.config.n_action_steps, :]
+        # actions = outputs[:, :self.config.n_action_steps, :]
 
         # logger.info("--- debug: raw chunk actions shapes ---")
         # _log_shapes(actions, logger, "raw chunk actions")
@@ -379,8 +386,8 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
 
         # 字段命名?
         forward_inputs = {
-            "chains": outputs["chains"],
-            "denoise_inds": outputs["denoise_inds"],
+            # "chains": outputs["chains"],
+            # "denoise_inds": outputs["denoise_inds"],
             # "observations/image": env_obs["images"],
             # "observations/state": env_obs["states"],
             # "tokenized_prompt": processed_obs["tokenized_prompt"],
@@ -391,10 +398,18 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
             pass
 
         result = {
-            "prev_logprobs": outputs["prev_logprobs"],
-            "prev_values": outputs["prev_values"],
+            # "prev_logprobs": outputs["prev_logprobs"],
+            # "prev_values": outputs["prev_values"],
             "forward_inputs": forward_inputs,
         }
+
+        from rlinf.utils.logging import get_logger
+        logger = get_logger()
+        logger.info(f"chunk start")
+        for _ in range(actions.shape[1]):
+            logger.info(f"gripper: {actions[0, _, -1].item()}")
+        logger.info(f"chunk end")
+
         return actions, result
 
     """
@@ -433,11 +448,13 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
 
         # SmolVLA似乎不需要这一步
         # pre-att-2d-masks to 4d
+        # pre_att_2d_masks = self.prepare_attention_masks_4d(pre_att_2d_masks)
 
         (prefix_output, _), past_key_values = self.vlm_with_expert.forward(
             attention_mask=pre_att_2d_masks,
             position_ids=prefix_position_ids,
             inputs_embeds=[prefix_embs, None],
+            past_key_values=None,
             use_cache=True,
             fill_kv_cache=True,
         )
@@ -623,6 +640,14 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
         x_t_mean = x0_pred * x0_weight + x1_pred * x1_weight
         return x_t_mean, x_t_std, value_t
 
+    def prepare_attention_masks_4d(self, att_2d_masks):
+        """
+        Helper method to prepare 4D attention masks for transformer.
+        Copied from OpenPI's implementation.
+        """
+        att_2d_masks_4d = att_2d_masks[:, None, :, :]
+        return torch.where(att_2d_masks_4d, 0.0, -2.3819763e38)
+
     def get_suffix_out(
         self,
         state,
@@ -643,30 +668,30 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
         # - 0-dim tensor
         # - 1-dim tensor of length batch_size
         # - higher-dim tensor that can be squeezed/reshaped to (batch_size,)
-        batch_size = prefix_pad_masks.shape[0]
-        device = state.device if torch.is_tensor(state) else None
+        # batch_size = prefix_pad_masks.shape[0]
+        # device = state.device if torch.is_tensor(state) else None
 
-        if not torch.is_tensor(timestep):
-            # scalar or python object -> fill batch
-            try:
-                tval = float(timestep)
-            except Exception:
-                tval = 0.0
-            timestep = torch.full((batch_size,), tval, dtype=torch.float32, device=device)
-        else:
-            # coerce dtype/device and shape
-            timestep = timestep.to(device=device, dtype=torch.float32)
-            if timestep.ndim == 0:
-                timestep = timestep.expand(batch_size)
-            elif timestep.ndim == 1 and timestep.shape[0] == batch_size:
-                pass
-            else:
-                try:
-                    timestep = timestep.reshape(batch_size)
-                except Exception:
-                    timestep = timestep.squeeze()
-                    if timestep.ndim == 0:
-                        timestep = timestep.expand(batch_size)
+        # if not torch.is_tensor(timestep):
+        #     # scalar or python object -> fill batch
+        #     try:
+        #         tval = float(timestep)
+        #     except Exception:
+        #         tval = 0.0
+        #     timestep = torch.full((batch_size,), tval, dtype=torch.float32, device=device)
+        # else:
+        #     # coerce dtype/device and shape
+        #     timestep = timestep.to(device=device, dtype=torch.float32)
+        #     if timestep.ndim == 0:
+        #         timestep = timestep.expand(batch_size)
+        #     elif timestep.ndim == 1 and timestep.shape[0] == batch_size:
+        #         pass
+        #     else:
+        #         try:
+        #             timestep = timestep.reshape(batch_size)
+        #         except Exception:
+        #             timestep = timestep.squeeze()
+        #             if timestep.ndim == 0:
+        #                 timestep = timestep.expand(batch_size)
 
         suffix_embs, suffix_pad_masks, suffix_att_masks = (
             self.embed_suffix(
@@ -676,7 +701,7 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
         )
 
         suffix_len = suffix_pad_masks.shape[1]
-        batch_size = suffix_pad_masks.shape[0]
+        batch_size = prefix_pad_masks.shape[0]
         # prefix_len should come from prefix_pad_masks passed into this function
         prefix_len = prefix_pad_masks.shape[1]
 
@@ -702,13 +727,15 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
         # SmolVLA似乎不需要这一步
         # Prepare attention masks
         # full_att_2d_masks_4d = self.
+        # full_att_2d_masks = self.prepare_attention_masks_4d(full_att_2d_masks)
 
         outputs_embeds, _ = self.vlm_with_expert.forward(
             attention_mask=full_att_2d_masks,
             position_ids=postion_ids,
             past_key_values=past_key_values,
             inputs_embeds=[None, suffix_embs],
-            use_cache=self.config.use_cache,
+            # use_cache=self.config.use_cache, # when False, there is error.
+            use_cache=True,
             fill_kv_cache=False,
         )
 

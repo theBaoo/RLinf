@@ -4,9 +4,16 @@ export EMBODIED_PATH="$( cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd )"
 export REPO_PATH=$(dirname $(dirname "$EMBODIED_PATH"))
 export SRC_FILE="${EMBODIED_PATH}/eval_embodied_agent.py"
 
-export MUJOCO_GL="osmesa"
-export PYOPENGL_PLATFORM="osmesa"
-export PYTHONPATH=${REPO_PATH}:$PYTHONPATH
+export MUJOCO_GL="egl"
+export PYOPENGL_PLATFORM="egl"
+
+# Prefer local LIBERO source to avoid wrong site-packages resolution
+export LIBERO_PATH=${LIBERO_PATH:-/home/bao_zonghuang/codes/python/LIBERO}
+if [ -d "$LIBERO_PATH" ]; then
+    export PYTHONPATH=${LIBERO_PATH}:${REPO_PATH}:$PYTHONPATH
+else
+    export PYTHONPATH=${REPO_PATH}:$PYTHONPATH
+fi
 
 # Base path to the BEHAVIOR dataset, which is the BEHAVIOR-1k repo's dataset folder
 # Only required when running the behavior experiment.
