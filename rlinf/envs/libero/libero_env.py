@@ -52,6 +52,8 @@ class LiberoEnv(gym.Env):
         self.num_group = self.num_envs // self.group_size
         self.use_fixed_reset_state_ids = cfg.use_fixed_reset_state_ids
         self.specific_reset_id = cfg.get("specific_reset_id", None)
+        # Whether to use recorded init states (overrides BDDL initial placements)
+        self.use_recorded_init_state = cfg.get("use_recorded_init_state", False)
 
         self.ignore_terminations = cfg.ignore_terminations
         self.auto_reset = cfg.auto_reset
@@ -315,8 +317,9 @@ class LiberoEnv(gym.Env):
             self.env.reconfigure_env_fns(env_fn_params, reconfig_env_idx)
         self.env.seed(self.seed * len(env_idx))
         self.env.reset(id=env_idx)
-        init_state = self._get_reset_states(env_idx=env_idx)
-        self.env.set_init_state(init_state=init_state, id=env_idx)
+        if self.use_recorded_init_state:
+            init_state = self._get_reset_states(env_idx=env_idx)
+            self.env.set_init_state(init_state=init_state, id=env_idx)
 
     def reset(
         self,

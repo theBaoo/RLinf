@@ -15,7 +15,7 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: 0
+    actor,env,rollout: 1
 
 runner:
   task_type: embodied
@@ -42,7 +42,7 @@ algorithm:
   kl_penalty: kl  # how to estimate kl divergence: kl or kl_penalty
   group_size: 1
   reward_coef: 1.0
-  rollout_epoch: 8
+  rollout_epoch: 2 # from 8 to 2
   eval_rollout_epoch: 1 # set eval_rollout_epoch > 0 when enable runner.only_eval or runner.val_check_interval > 0
 
   reward_type: chunk_level
@@ -90,19 +90,19 @@ env:
     name: "env_buffer_list"
     queue_name: "obs_buffer"
     queue_size: 0
-  enable_offload: False
+  enable_offload: False # seamingly only support maniskill
 
   # Override the default values in env/libero_object
   train:
-    total_num_envs: 8 # from 64 to 8
-    max_episode_steps: 240
-    max_steps_per_rollout_epoch: 240
+    total_num_envs: 1 # from 64 to 8
+    max_episode_steps: 250
+    max_steps_per_rollout_epoch: 250
   eval:
     total_num_envs: 1 # from 500 to 1
     auto_reset: True
     ignore_terminations: False
-    max_episode_steps: 240 # from 240 to 300
-    max_steps_per_rollout_epoch: 240 # from 240 to 300
+    max_episode_steps: 300 # from 240 to 300
+    max_steps_per_rollout_epoch: 3000 # from 240 to 300
     group_size: 1
     use_fixed_reset_state_ids: True
     is_eval: True
@@ -134,18 +134,22 @@ actor:
     queue_name: "replay_buffer"
     queue_size: 0
   training_backend: "fsdp"
-  micro_batch_size: 128
-  global_batch_size: 2048 # maximum : global batch size = micro batch size * actor num_processes.
+  # from 128 to 4
+  micro_batch_size: 4
+  # from 2048 to 100 for aligning with reducing algorithem.rollout_epochs
+  global_batch_size: 100 # maximum : global batch size = micro batch size * actor num_processes.
   seed: 42
-  enable_offload: False
+  enable_offload: True
 
-  # Override the default values in model/pi0
+  # Override the default values in model/smolvla
   model:
     model_path: "/path/to/model/RLinf-Pi0-SFT-Spatial-Object-Goal"
     model_type: "smolvla"
+    # precision: fp16
     num_action_chunks: 5 # interface for the env
     add_value_head: True
-    # openpi specific parameters
+    is_lora: True
+    # smolvla specific parameters
     smolvla:
       # detach_critic_input: True
 
@@ -167,6 +171,7 @@ actor:
       param_dtype: ${actor.model.precision}
       reduce_dtype: ${actor.model.precision}
       buffer_dtype: ${actor.model.precision}
+    use_orig_params: False
 
 reward:
   use_reward_model: False

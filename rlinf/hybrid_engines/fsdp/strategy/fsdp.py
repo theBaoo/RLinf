@@ -77,6 +77,30 @@ class FSDPStrategy(FSDPStrategyBase):
             self.cfg.fsdp_config.backward_prefetch
         )
 
+        # Collect fully frozen submodules to avoid mixing requires_grad during flattening
+        # when use_orig_params=False. This keeps the default config intact but prevents
+        # root-level FSDP from flattening trainable and frozen params together.
+        ignored_modules: list[nn.Module] = []
+
+        def module_has_params(m: nn.Module) -> bool:
+            try:
+                next(m.parameters())
+                return True
+            except StopIteration:
+                return False
+
+        for sub in model.modules():
+            if sub is model:
+                continue
+            if module_has_params(sub):
+                all_frozen = True
+                for p in sub.parameters():
+                    if p.requires_grad:
+                        all_frozen = False
+                        break
+                if all_frozen:
+                    ignored_modules.append(sub)
+
         fsdp_model = FSDP(
             module=model,
             param_init_fn=init_fn,
@@ -90,6 +114,7 @@ class FSDPStrategy(FSDPStrategyBase):
             backward_prefetch=backward_prefetch,
             limit_all_gathers=self.cfg.fsdp_config.limit_all_gathers,
             use_orig_params=self.cfg.fsdp_config.use_orig_params,
+            ignored_modules=ignored_modules if len(ignored_modules) > 0 else None,
         )
         return fsdp_model
 

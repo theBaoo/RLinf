@@ -279,12 +279,16 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
         chains = data["chains"]
         denoise_inds = data["denoise_inds"]
 
-        # TODO: input transform
-        processed_obs = self.input_processor(data)
-        images, img_masks = self.prepare_images(processed_obs)
-        lang_tokens = processed_obs[f"{OBS_LANGUAGE_TOKENS}"]
-        lang_masks = processed_obs[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
-        state = self.prepare_state(processed_obs)
+        # processed_obs = self.input_processor(data)
+        # images, img_masks = self.prepare_images(processed_obs)
+        # lang_tokens = processed_obs[f"{OBS_LANGUAGE_TOKENS}"]
+        # lang_masks = processed_obs[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+        # state = self.prepare_state(processed_obs)
+        images = [data["images1"], data["images2"]]
+        img_masks = [data["img_masks1"], data["img_masks2"]]
+        lang_tokens = data["lang_tokens"]
+        lang_masks = data["lang_masks"]
+        state = data["state"]
 
         device = chains.device
         images = [img.to(device) for img in images]
@@ -386,29 +390,34 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
 
         # 字段命名?
         forward_inputs = {
-            # "chains": outputs["chains"],
-            # "denoise_inds": outputs["denoise_inds"],
-            # "observations/image": env_obs["images"],
-            # "observations/state": env_obs["states"],
-            # "tokenized_prompt": processed_obs["tokenized_prompt"],
-            # "tokenized_prompt_mask": processed_obs["tokenized_prompt_mask"],
+            "chains": outputs["chains"],
+            "denoise_inds": outputs["denoise_inds"],
+            # used for get_log_prob_value
+            # RLinf expects these fields tensor
+            "images1": images[0],
+            "images2": images[1],
+            "img_masks1": img_masks[0],
+            "img_masks2": img_masks[1],
+            "lang_tokens": lang_tokens,
+            "lang_masks": lang_masks,
+            "state": state,
         }
         if self.config.simulator_type == "libero":
             # forward_inputs["observations/wrist_image"] = env_obs["wrist_images"]
             pass
 
         result = {
-            # "prev_logprobs": outputs["prev_logprobs"],
-            # "prev_values": outputs["prev_values"],
+            "prev_logprobs": outputs["prev_logprobs"],
+            "prev_values": outputs["prev_values"],
             "forward_inputs": forward_inputs,
         }
 
-        from rlinf.utils.logging import get_logger
-        logger = get_logger()
-        logger.info(f"chunk start")
-        for _ in range(actions.shape[1]):
-            logger.info(f"gripper: {actions[0, _, -1].item()}")
-        logger.info(f"chunk end")
+        # from rlinf.utils.logging import get_logger
+        # logger = get_logger()
+        # logger.info(f"chunk start")
+        # for _ in range(actions.shape[1]):
+        #     logger.info(f"gripper: {actions[0, _, -1].item()}")
+        # logger.info(f"chunk end")
 
         return actions, result
 
@@ -868,5 +877,5 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
     def freeze_vlm(self):
         if self.config.train_expert_only:
             self.vlm_with_expert.eval()
-            for param in self.vlm_with_expert.parameters():
+            for param in self.vlm_with_expert.vlm.parameters():
                 param.requires_grad = False

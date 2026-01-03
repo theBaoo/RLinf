@@ -3,10 +3,10 @@ model_type: "smolvla"
 # Model path - should be set in specific config files
 model_path: "/path/to/model/smolvla"
 
-precision: null # COPIED FROM OPENPI: for openpi, precision is null, please do not change this value
+precision: fp32 # COPIED FROM OPENPI: for openpi, precision is null, please do not change this value
 
 # Action and chunk settings
-num_action_chunks: 5 # smolvla_libero has n_action_chunk = 1
+num_action_chunks: 1 # smolvla_libero has n_action_chunk = 1
 action_dim: 7
 
 # LoRA settings
@@ -15,7 +15,7 @@ lora_rank: 32
 
 # Training settings
 use_proprio: True
-num_steps: 5
+num_steps: 10
 add_value_head: False
 
 # openpi specific parameters

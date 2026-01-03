@@ -1172,11 +1172,39 @@ class EmbodiedRolloutResult:
                     merged_forward_inputs[k].append(v)
                 else:
                     merged_forward_inputs[k] = [v]
-        for k in merged_forward_inputs.keys():
+        for k, vs in merged_forward_inputs.items():
             assert k not in ["dones", "rewards", "prev_logprobs", "prev_values"]
-            rollout_result_dict[k] = (
-                torch.stack(merged_forward_inputs[k], dim=0).cpu().contiguous()
-            )
+            # Require tensor-like entries; attempt best-effort conversion, else skip
+            if not all(torch.is_tensor(v) for v in vs):
+                can_convert = all(isinstance(v, list) and all(torch.is_tensor(e) for e in v) for v in vs)
+                if can_convert:
+                    vs = [torch.stack(v, dim=0) for v in vs]
+                else:
+                    # Skip incompatible keys to avoid crashing
+                    continue
+
+            if k == "chains":
+                # Compress heavy diffusion chains to save host/Ray memory during transfer
+                vs = [v.to(dtype=torch.float16) for v in vs]
+
+            # lang_tokens vary in different tasks, so we need to pad them to the max length
+            # If sequence lengths (dim=1) vary across timesteps, pad to max along dim=1
+            if all(v.dim() >= 2 for v in vs):
+                seq_lens = [v.shape[1] for v in vs]
+                max_len = max(seq_lens)
+                if any(l != max_len for l in seq_lens):
+                    padded_vs = []
+                    for v in vs:
+                        if v.shape[1] == max_len:
+                            padded_vs.append(v)
+                        else:
+                            new_shape = (v.shape[0], max_len) + v.shape[2:]
+                            pad_tensor = torch.zeros(new_shape, dtype=v.dtype)
+                            pad_tensor[:, : v.shape[1]] = v
+                            padded_vs.append(pad_tensor)
+                    vs = padded_vs
+
+            rollout_result_dict[k] = torch.stack(vs, dim=0).cpu().contiguous()
 
         assert len(rollout_result_dict["dones"]) == len(
             rollout_result_dict["prev_values"]

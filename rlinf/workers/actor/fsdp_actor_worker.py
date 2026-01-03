@@ -786,8 +786,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
                 self.optimizer.zero_grad()
                 for idx, data in enumerate(train_micro_batch):
+                    device = f"cuda:{int(os.environ['LOCAL_RANK'])}"
                     for k, v in data.items():
-                        data[k] = v.to(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+                        if k == "chains":
+                            # Upcast compressed chains back to fp32 before model forward
+                            data[k] = v.to(device, dtype=torch.float32)
+                        else:
+                            data[k] = v.to(device)
                     backward_ctx = self.before_micro_batch(
                         self.model,
                         is_last_micro_batch=(idx + 1) == self.gradient_accumulation,

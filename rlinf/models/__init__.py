@@ -416,6 +416,8 @@ def get_model(cfg: DictConfig, override_config_kwargs=None):
             # logger.warning(f"以下 ckpt keys 未匹配到模型参数: {mismatched_keys}")
         res = model.load_state_dict(new_ckpt, strict=False)
         # logger.info(f"SmolVLA load_state_dict result: {res}")
+
+        model.to(torch_dtype)
     else:
         return None
     if torch.cuda.is_available():
