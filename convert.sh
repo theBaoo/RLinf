@@ -1,0 +1,1 @@
+python toolkits/ckpt_convertor/merge_lora_safetensors.py --input logs/20260413-13:36:35/test_smolvla/checkpoints/global_step_10/actor/model/model-00001-of-00001.safetensors --output-dir logs/20260413-13:36:35/test_smolvla/checkpoints/global_step_10/actor/model_merged --strip-prefix base_model.model. --lora-alpha 32 --lora-rank 32

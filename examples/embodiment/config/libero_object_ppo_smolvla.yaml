@@ -15,7 +15,7 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: 1
+    actor,env,rollout: 2
 
 runner:
   task_type: embodied
@@ -25,7 +25,7 @@ runner:
     experiment_name: "test_smolvla"
     logger_backends: ["tensorboard"] # wandb, swanlab
 
-  max_epochs: 1000
+  max_epochs: 2
   max_steps: -1
 
   only_eval: False
@@ -98,14 +98,15 @@ env:
     max_episode_steps: 250
     max_steps_per_rollout_epoch: 250
   eval:
-    total_num_envs: 1 # from 500 to 1
+    total_num_envs: 10 # from 500 to 1
     auto_reset: True
     ignore_terminations: False
     max_episode_steps: 300 # from 240 to 300
-    max_steps_per_rollout_epoch: 3000 # from 240 to 300
+    max_steps_per_rollout_epoch: 300 # from 240 to 300
     group_size: 1
-    use_fixed_reset_state_ids: True
+    use_fixed_reset_state_ids: False
     is_eval: True
+    # use_recorded_init_state: True
     video_cfg:
       save_video: True
       video_base_dir: ${runner.logger.log_path}/video/eval
@@ -139,14 +140,14 @@ actor:
   # from 2048 to 100 for aligning with reducing algorithem.rollout_epochs
   global_batch_size: 100 # maximum : global batch size = micro batch size * actor num_processes.
   seed: 42
-  enable_offload: True
+  enable_offload: False
 
   # Override the default values in model/smolvla
   model:
     model_path: "/path/to/model/RLinf-Pi0-SFT-Spatial-Object-Goal"
     model_type: "smolvla"
-    # precision: fp16
-    num_action_chunks: 5 # interface for the env
+    # precision: bf16
+    num_action_chunks: 1 # interface for the env
     add_value_head: True
     is_lora: True
     # smolvla specific parameters

@@ -10,7 +10,7 @@ export PYOPENGL_PLATFORM="egl"
 # export PYTHONPATH=${REPO_PATH}:$PYTHONPATH
 
 # Prefer local LIBERO source to avoid wrong site-packages resolution
-export LIBERO_PATH=${LIBERO_PATH:-/home/bao_zonghuang/codes/python/LIBERO}
+export LIBERO_PATH=${LIBERO_PATH:-/home/bao_zonghuang/codes/python/LIBERO-PRO}
 if [ -d "$LIBERO_PATH" ]; then
     export PYTHONPATH=${LIBERO_PATH}:${REPO_PATH}:$PYTHONPATH
 else

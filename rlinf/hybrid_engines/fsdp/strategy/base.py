@@ -232,6 +232,15 @@ class FSDPStrategyBase(ABC):
         """
         torch.distributed.barrier()
         opts = StateDictOptions(full_state_dict=False, cpu_offload=True)
+
+        # Some historical checkpoints were saved without
+        # optimizer.param_groups[*].initial_lr. Remove this key from the local
+        # optimizer state before planning load, so old/new checkpoints can be
+        # resumed with the same code path.
+        for group in optimizer.param_groups:
+            if isinstance(group, dict):
+                group.pop("initial_lr", None)
+
         try:
             training_state = Checkpoint(
                 model=model,

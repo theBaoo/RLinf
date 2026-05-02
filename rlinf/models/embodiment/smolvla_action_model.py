@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from collections import deque
 import torch
 import random
+import math
 
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.smolvla.modeling_smolvla import VLAFlowMatching, make_att_2d_masks, resize_with_pad, pad_vector
@@ -57,13 +58,12 @@ class SmolVLAForRLConfig(SmolVLAConfig):
     Configuration class for SmolVLA model adapted for reinforcement learning tasks.
     Copied from OpenPi's config.
     """
-    # noise_level: bool = 0.5 ?
-    noise_level = 0.5,
+    noise_level: float = 0.2
     action_chunk: int = 5
     train_expert_only: bool = False
     action_env_dim: int = 7  # for libero
     num_steps: int = 10
-    noise_method: str = "reinflow"  # flow_sde, flow_cps
+    noise_method: str = "flow_cps" # "reinflow"  # flow_sde, flow_cps
     safe_get_logprob: bool = False
     joint_logprob: bool = False
     double_layer: bool = False
@@ -78,6 +78,9 @@ class SmolVLAForRLConfig(SmolVLAConfig):
     value_after_vlm: bool = False
     value_vlm_mode: str = "mean_token"  # last_token, mean_token, first_token
     simulator_type: str = "libero"  # libero, maniskill, robotwin, metaworld
+    cast_inputs_to_model_dtype: bool = True
+    debug_logprob_norm: bool = False
+    debug_logprob_norm_interval: int = 200
 
 class SmolVLAForRLActionPrediction(VLAFlowMatching):
     """
@@ -104,15 +107,17 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
             proj_width = 480 # smolvla
 
         self.global_step = 0
+        self._logprob_norm_debug_calls = 0
 
         if self.config.add_value_head:
             self.value_head = ValueHead(
                 input_dim=proj_width,
-                hidden_sizes=[256, 128],
+                hidden_sizes=(512, 256, 128),
                 output_dim=1,
-                activation="tanh",
+                activation="relu",
                 bias_last=True,
             )
+            # self.value_head.to(torch.bfloat16)
 
         self.use_vlm_value = getattr(self.config, "value_after_vlm", False) and getattr(
             self.config, "add_value_head", False
@@ -135,6 +140,26 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
 
     def set_global_step(self, step):
         self.global_step = step
+
+    def _get_model_dtype(self) -> torch.dtype:
+        if hasattr(self, "action_in_proj") and hasattr(self.action_in_proj, "weight"):
+            return self.action_in_proj.weight.dtype
+        return next(self.parameters()).dtype
+
+    def _cast_float_tensor(self, x: torch.Tensor) -> torch.Tensor:
+        if not torch.is_tensor(x):
+            return x
+        if not x.is_floating_point():
+            return x
+        if not getattr(self.config, "cast_inputs_to_model_dtype", True):
+            return x
+        target_dtype = self._get_model_dtype()
+        if x.dtype == target_dtype:
+            return x
+        return x.to(dtype=target_dtype)
+
+    def _cast_float_tensor_list(self, xs: list[torch.Tensor]) -> list[torch.Tensor]:
+        return [self._cast_float_tensor(x) for x in xs]
 
     def setup_processor(
         self,
@@ -268,6 +293,7 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
         """Pad state"""
         state = batch[OBS_STATE][:, -1, :] if batch[OBS_STATE].ndim > 2 else batch[OBS_STATE]
         state = pad_vector(state, self.config.max_state_dim)
+        state = self._cast_float_tensor(state)
         return state
 
     def forward(
@@ -276,26 +302,19 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
         **kwargs
     ):
         compute_values = kwargs.get("compute_values", False)
-        chains = data["chains"]
+        chains = self._cast_float_tensor(data["chains"])
         denoise_inds = data["denoise_inds"]
 
-        # processed_obs = self.input_processor(data)
-        # images, img_masks = self.prepare_images(processed_obs)
-        # lang_tokens = processed_obs[f"{OBS_LANGUAGE_TOKENS}"]
-        # lang_masks = processed_obs[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
-        # state = self.prepare_state(processed_obs)
-        images = [data["images1"], data["images2"]]
-        img_masks = [data["img_masks1"], data["img_masks2"]]
-        lang_tokens = data["lang_tokens"]
-        lang_masks = data["lang_masks"]
-        state = data["state"]
+        images, img_masks, lang_tokens, lang_masks, state = self.preprocess_for_train(data)
+        images = self._cast_float_tensor_list(images)
+        state = self._cast_float_tensor(state)
 
         device = chains.device
         images = [img.to(device) for img in images]
         img_masks = [img_mask.to(device) for img_mask in img_masks]
         state = state.to(device)
 
-        log_probs, value_t = self.get_log_prob_value(
+        log_probs, value_t, entropy = self.get_log_prob_value(
             images,
             img_masks,
             lang_tokens,
@@ -306,29 +325,24 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
             compute_values,
         )
         log_probs = log_probs[
-            :, :, : self.config.action_chunk, : self.config.action_env_dim
+            :, :, : self.config.n_action_steps, : self.config.action_env_dim
+        ]
+        entropy = entropy[
+            :, :, : self.config.n_action_steps, : self.config.action_env_dim
         ]
 
         # post process
-        if self.config.joint_logprob:
-            log_probs = log_probs.mean(dim=1)
-            prev_logprobs = data["prev_logprobs"].mean(dim=1)
-        else:
-            bsize = log_probs.shape[0]
-            log_probs = log_probs[:, 0]
-            prev_logprobs = data["prev_logprobs"]
-            prev_logprobs = prev_logprobs[
-                torch.arange(bsize),
-                denoise_inds[:, 0],
-                : self.config.action_chunk,
-                : self.config.action_env_dim,
-            ]
+        # if self.config.joint_logprob:
+        log_probs = log_probs.mean(dim=1)
+        entropy = entropy.mean(dim=[1, 2, 3], keepdim=False)[
+            :, None
+        ]
         value_t = value_t.mean(dim=-1, keepdim=False)
         return {
             "logprobs": log_probs,
-            "prev_logprobs": prev_logprobs,
+            # "prev_logprobs": prev_logprobs,
             "values": value_t,
-            "entropy": None,
+            "entropy": entropy,
         }
 
     @torch.no_grad()
@@ -345,6 +359,8 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
         lang_tokens = processed_obs[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = processed_obs[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         state = self.prepare_state(processed_obs)
+        images = self._cast_float_tensor_list(images)
+        state = self._cast_float_tensor(state)
         # call sample_actions with keyword args so positional 'mode' is not interpreted as 'noise'
         outputs = self.sample_actions(
             images,
@@ -392,15 +408,15 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
         forward_inputs = {
             "chains": outputs["chains"],
             "denoise_inds": outputs["denoise_inds"],
-            # used for get_log_prob_value
-            # RLinf expects these fields tensor
-            "images1": images[0],
-            "images2": images[1],
-            "img_masks1": img_masks[0],
-            "img_masks2": img_masks[1],
+            # OpenPI-like: keep raw obs tensors for memory efficiency.
+            "obs_images": env_obs["images"],
+            "obs_wrist_images": env_obs["wrist_images"],
+            "obs_states": env_obs["states"],
+            # Keep rollout language tokens for deterministic train-time logprob/value.
             "lang_tokens": lang_tokens,
             "lang_masks": lang_masks,
-            "state": state,
+            # Still pass raw task text for preprocessing parity in forward.
+            "task_descriptions": env_obs["task_descriptions"],
         }
         if self.config.simulator_type == "libero":
             # forward_inputs["observations/wrist_image"] = env_obs["wrist_images"]
@@ -446,6 +462,7 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
         if noise is None:
             action_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
             noise = self.sample_noise(action_shape, device)
+        noise = self._cast_float_tensor(noise)
         
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state
@@ -494,8 +511,16 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
             if self.config.joint_logprob:
                 denoise_inds = torch.arange(num_steps)
             else:
-                if self.config.noise_method == "reinflow":
-                    denoise_inds = torch.tensor([random.randint(0, num_steps - 1)] * num_steps)
+                # if self.config.noise_method == "reinflow":
+                #     denoise_inds = torch.tensor([random.randint(0, num_steps - 1)] * num_steps)
+                if self.config.ignore_last:
+                    denoise_inds = torch.tensor(
+                        [random.randint(0, num_steps - 2)] * num_steps
+                    )
+                else:
+                    denoise_inds = torch.tensor(
+                        [random.randint(0, num_steps - 1)] * num_steps
+                    )
         denoise_inds = denoise_inds[None].repeat(bsize, 1)
 
         # denoise_inds
@@ -530,7 +555,7 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
         x_0 = x_t
         chains = torch.stack(chains, dim=1)
         log_probs = torch.stack(log_probs, dim=1)[
-            :, :, : self.config.chunk_size, : self.config.action_env_dim
+            :, :, : self.config.n_action_steps, : self.config.action_env_dim
         ]
 
         if self.config.joint_logprob:
@@ -566,6 +591,9 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
         mode, # "train" or "eval"
         denoise_steps,
         compute_values=True,
+        prefix_embs=None,
+        prefix_att_masks=None,
+        use_train_forward=False,
     ):
         """
         Sample the mean, variance and value of the action at a given timestep.
@@ -576,16 +604,20 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
         device = state.device
         if isinstance(idx, int):
             idx = torch.tensor(idx).expand(bsize)
+        x_t = self._cast_float_tensor(x_t)
         # build parameters
         if self.config.noise_anneal:
             # 线性插值
             noise_start, noise_end, noise_anneal_steps = self.config.noise_params
-            noise_level = max(
-                noise_end,
-                noise_start - (noise_start - noise_end) * denoise_steps / noise_anneal_steps
+            noise_level = (
+                noise_start
+                + (noise_end - noise_start)
+                * min(self.global_step, noise_anneal_steps)
+                / noise_anneal_steps
             )
+            noise_level = torch.tensor(noise_level).to(device)
         else:
-            noise_level = self.config.noise_level
+            noise_level = torch.tensor(self.config.noise_level).to(device)
         timesteps = torch.linspace(
             1,
             1 / denoise_steps,
@@ -599,13 +631,26 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
         t_input = timesteps[idx]
         delta = timesteps[idx] - timesteps[idx + 1] # 离散时间步步长
         # velocity prediction
-        suffix_out = self.get_suffix_out(
-            state,
-            prefix_pad_masks,
-            past_key_values,
-            x_t,
-            t_input,
-        )
+        if use_train_forward:
+            if prefix_embs is None or prefix_att_masks is None:
+                raise ValueError(
+                    "prefix_embs and prefix_att_masks are required when use_train_forward=True"
+                )
+            suffix_out = self.get_suffix_out_train(
+                prefix_embs,
+                prefix_pad_masks,
+                prefix_att_masks,
+                x_t,
+                t_input,
+            )
+        else:
+            suffix_out = self.get_suffix_out(
+                state,
+                prefix_pad_masks,
+                past_key_values,
+                x_t,
+                t_input,
+            )
         v_t = self.action_out_proj(suffix_out)  # 预测的速度场, [bs, n_action_steps, max_action_dim]
         # value prediction
         if (
@@ -630,7 +675,7 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
         delta = delta[:, None, None].expand_as(x_t)
         t_input = t_input[:, None, None].expand_as(x_t)
         x0_pred = x_t - v_t * t_input
-        x1_pred = x_t - v_t * (1 - t_input)
+        x1_pred = x_t + v_t * (1 - t_input) # ?
         if mode == "eval":
             x0_weight = 1 - (t_input - delta)
             x1_weight = t_input - delta
@@ -642,6 +687,25 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
                 x_t_std = self.reinflow_explore_noise_net(
                     suffix_out,
                 )
+            elif self.config.noise_method == "flow_sde":
+                sigmas = (
+                    noise_level
+                    * torch.sqrt(
+                        timesteps
+                        / (1 - torch.where(timesteps == 1, timesteps[1], timesteps))
+                    )[:-1]
+                )
+                sigma_i = sigmas[idx][:, None, None].expand_as(x_t)
+                x0_weight = torch.ones_like(t_input) - (t_input - delta)
+                x1_weight = t_input - delta - sigma_i**2 * delta / (2 * t_input)
+                x_t_std = torch.sqrt(delta) * sigma_i
+            elif self.config.noise_method == "flow_cps":
+                pi = torch.pi
+                cos_term = torch.cos(pi * noise_level / 2).to(device)
+                sin_term = torch.sin(pi * noise_level / 2).to(device)
+                x0_weight = torch.ones_like(t_input) - (t_input - delta)
+                x1_weight = (t_input - delta) * cos_term
+                x_t_std = (t_input - delta) * sin_term
             else:
                 raise ValueError(
                     f"Invalid noise method: {self.config.noise_method}"
@@ -743,19 +807,50 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
             position_ids=postion_ids,
             past_key_values=past_key_values,
             inputs_embeds=[None, suffix_embs],
-            # use_cache=self.config.use_cache, # when False, there is error.
+            # With non-empty past_key_values, use_cache must stay enabled so
+            # key/value states are concatenated with cached prefix states.
             use_cache=True,
             fill_kv_cache=False,
         )
 
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
+        suffix_out = self._cast_float_tensor(suffix_out)
 
         return suffix_out
 
-    # def embed_suffix(self, noisy_actions, timestep):
-    #     return super().embed_suffix(noisy_actions, timestep)
+    def get_suffix_out_train(
+        self,
+        prefix_embs,
+        prefix_pad_masks,
+        prefix_att_masks,
+        x_t,
+        timestep,
+    ):
+        """Training-only suffix forward.
+
+        Runs a single full forward with [prefix, suffix] embeddings to avoid
+        suffix-only cache constraints in SmolVLMWithExpert.
+        """
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
+            x_t, timestep
+        )
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+
+        (_, suffix_out), _ = self.vlm_with_expert.forward(
+            attention_mask=att_2d_masks,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, suffix_embs],
+            use_cache=False,
+            fill_kv_cache=False,
+        )
+        suffix_out = suffix_out[:, -self.config.chunk_size :]
+        suffix_out = self._cast_float_tensor(suffix_out)
+        return suffix_out
 
     def get_logprob_norm(self, sample, mu, sigma):
         """
@@ -765,6 +860,8 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
         """
         if self.config.safe_get_logprob:
             log_prob = -torch.pow((sample - mu), 2)
+            constant_term = None
+            exponent_term = None
         else:
             mask = sigma == 0
             sigma_safe = torch.where(mask, torch.ones_like(sigma), sigma)
@@ -774,10 +871,80 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
             exponent_term = -0.5 * torch.pow((sample - mu) / sigma_safe, 2)
             log_prob = constant_term + exponent_term
             log_prob = torch.where(mask, torch.zeros_like(log_prob), log_prob)
+
+        if getattr(self.config, "debug_logprob_norm", False):
+            self._logprob_norm_debug_calls += 1
+            interval = max(1, int(getattr(self.config, "debug_logprob_norm_interval", 200)))
+            if self._logprob_norm_debug_calls % interval == 0:
+                logger = get_logger()
+
+                def _brief(name, x):
+                    x = x.detach().float()
+                    return (
+                        f"{name}(shape={tuple(x.shape)},mean={x.mean().item():.6g},"
+                        f"std={x.std(unbiased=False).item():.6g},min={x.min().item():.6g},max={x.max().item():.6g})"
+                    )
+
+                parts = [
+                    _brief("sample", sample),
+                    _brief("mu", mu),
+                    _brief("sigma", sigma),
+                    _brief("log_prob", log_prob),
+                ]
+                if constant_term is not None and exponent_term is not None:
+                    parts.extend(
+                        [
+                            _brief("constant_term", constant_term),
+                            _brief("exponent_term", exponent_term),
+                        ]
+                    )
+                logger.info("[DBG-LOGPROB-NORM] " + " | ".join(parts))
         return log_prob
     
     def preprocess_for_train(self, data):
-        return data
+        if (
+            "obs_images" in data
+            and "obs_wrist_images" in data
+            and "obs_states" in data
+        ):
+            to_processed_obs = {
+                "observation.state": data["obs_states"],
+                "observation.images.image": data["obs_images"].to(torch.float32)
+                / 255.0,
+                "observation.images.image2": data["obs_wrist_images"].to(torch.float32)
+                / 255.0,
+                "task": data.get("task_descriptions", ""),
+            }
+        else:
+            raise KeyError(
+                "SmolVLA training forward expects raw obs tensors: obs_images/obs_wrist_images/obs_states"
+            )
+
+        # Keep training-time preprocessing path aligned with rollout by always invoking preprocessor.
+        # We intentionally discard regenerated language tokens to avoid rollout/train token drift.
+        processed_obs = self.preprocessor(to_processed_obs)
+
+        if OBS_LANGUAGE_TOKENS in data and OBS_LANGUAGE_ATTENTION_MASK in data:
+            lang_tokens = data[OBS_LANGUAGE_TOKENS]
+            lang_masks = data[OBS_LANGUAGE_ATTENTION_MASK]
+        elif "lang_tokens" in data and "lang_masks" in data:
+            lang_tokens = data["lang_tokens"]
+            lang_masks = data["lang_masks"]
+        elif OBS_LANGUAGE_TOKENS in processed_obs and OBS_LANGUAGE_ATTENTION_MASK in processed_obs:
+            # Fallback only when rollout did not carry language tokens.
+            lang_tokens = processed_obs[OBS_LANGUAGE_TOKENS]
+            lang_masks = processed_obs[OBS_LANGUAGE_ATTENTION_MASK]
+        else:
+            raise KeyError(
+                "SmolVLA training forward expects rollout lang_tokens/lang_masks"
+            )
+
+        images, img_masks = self.prepare_images(processed_obs)
+        state = self.prepare_state(processed_obs)
+        images = self._cast_float_tensor_list(images)
+        state = self._cast_float_tensor(state)
+
+        return images, img_masks, lang_tokens, lang_masks, state
     
     def get_log_prob_value(
         self,
@@ -788,29 +955,33 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
         state,
         chains,
         denoise_inds,
-        compute_values=True,
+        compute_values=False,
     ):
+        chains = self._cast_float_tensor(chains)
+        state = self._cast_float_tensor(state)
+        images = self._cast_float_tensor_list(images)
         bsize = state.shape[0]
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state
         )
-        pre_att_2d_masks = make_att_2d_masks(
-            prefix_pad_masks, prefix_att_masks
-        )
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-
-        # SmolVLA似乎不需要这一步
-        # compute image and language key value cache
-
-        [prefix_output, _], past_key_values = self.vlm_with_expert.forward(
-            attention_mask=pre_att_2d_masks,
-            position_ids=prefix_position_ids,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
-            fill_kv_cache=True,
-        )
+        if self.use_vlm_value:
+            pre_att_2d_masks = make_att_2d_masks(
+                prefix_pad_masks, prefix_att_masks
+            )
+            prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+            [prefix_output, _], _ = self.vlm_with_expert.forward(
+                attention_mask=pre_att_2d_masks,
+                position_ids=prefix_position_ids,
+                inputs_embeds=[prefix_embs, None],
+                use_cache=True,
+                fill_kv_cache=True,
+            )
+        else:
+            prefix_output = None
         chains_log_probs = []
         chains_values = []
+        chains_entropy = []
+
         if self.config.joint_logprob:
             num_steps = self.config.num_steps
             initial_log_prob = self.get_logprob_norm(
@@ -818,7 +989,9 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
                 torch.zeros_like(chains[:, 0]),
                 torch.ones_like(chains[:, 0]),
             )
+            initial_entropy = self.gaussian_entropy(torch.ones_like(chains[:, 0]))
             chains_log_probs.append(initial_log_prob)
+            chains_entropy.append(initial_entropy)
         else:
             num_steps = 1
         for idx in range(num_steps):
@@ -830,25 +1003,37 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
                 denoise_ind,
                 state,
                 prefix_pad_masks,
-                past_key_values,
+                past_key_values=None,
                 mode="train",
                 denoise_steps=self.config.num_steps,
+                compute_values=compute_values,
+                prefix_embs=prefix_embs,
+                prefix_att_masks=prefix_att_masks,
+                use_train_forward=True,
             )
             log_probs = self.get_logprob_norm(
                 chains_nxt,
                 x_t_mean,
                 x_t_std,
             )
+            entropy = self.gaussian_entropy(x_t_std)
             chains_log_probs.append(log_probs)
+            chains_entropy.append(entropy)
             if self.use_vlm_value:
                 chains_values.append(self.get_value_from_vlm(prefix_output))
             else:
                 chains_values.append(value_t)
         chains_log_probs = torch.stack(chains_log_probs, dim=1)
         chains_values = torch.stack(chains_values, dim=1)
-        return chains_log_probs, chains_values
+
+        if self.config.noise_method == "reinflow":
+            chains_entropy = torch.stack(chains_entropy, dim=1)
+        else:
+            chains_entropy = torch.zeros_like(chains_log_probs)
+        return chains_log_probs, chains_values, chains_entropy
 
     def get_value_from_vlm(self, prefix_output):
+        # prefix_output.shape: [1, 141, 960]
         # TODO: 获取SmolVLA的下两个数值
         lang_length = 0
         all_length = 0
@@ -870,12 +1055,18 @@ class SmolVLAForRLActionPrediction(VLAFlowMatching):
             prefix_mask = [True] * 1 + [False] * (all_length - 1)
         prefix_out_value = prefix_output[:, prefix_mask, :]
         prefix_out_value = prefix_out_value.mean(dim=1, keepdim=False)
-        prefix_out_value = prefix_out_value.to(dtype=torch.float32)
+        prefix_out_value = self._cast_float_tensor(prefix_out_value)
         values_vlm = self.value_head(prefix_out_value)[:, 0]
         return values_vlm
 
+    def gaussian_entropy(self, sigma):
+        mask = sigma == 0
+        sigma_safe = torch.where(mask, torch.ones_like(sigma), sigma)
+        entropy = 0.5 * torch.log(2 * math.pi * math.e * (sigma_safe**2))
+        return entropy
+
     def freeze_vlm(self):
         if self.config.train_expert_only:
-            self.vlm_with_expert.eval()
+            self.vlm_with_expert.vlm.eval()
             for param in self.vlm_with_expert.vlm.parameters():
                 param.requires_grad = False

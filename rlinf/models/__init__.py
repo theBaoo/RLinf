@@ -338,11 +338,19 @@ def get_model(cfg: DictConfig, override_config_kwargs=None):
         actor_model_config = actor_train_config
         actor_model_config.load_vlm_weights = True
         actor_model_config.pretrained_path = 'HuggingFaceVLA/smolvla_libero'
+        actor_model_config.vlm_model_name = 'HuggingFaceTB/SmolVLM2-500M-Instruct'
         actor_model_config.expert_width_multiplier = 0.5
-        actor_model_config.n_action_steps = 5
+        actor_model_config.n_action_steps = cfg.num_action_chunks
+        actor_model_config.chunk_size = 1
         # 使用下面两条配置后, 可以完成eval
         actor_model_config.num_vlm_layers = 0
         actor_model_config.prefix_length = 0
+
+        actor_model_config.add_value_head = cfg.add_value_head
+        actor_model_config.value_after_vlm = False
+        actor_model_config.detach_critic_input = cfg.smolvla.detach_critic_input
+
+        actor_model_config.train_expert_only = True
 
         # actor_model_config.num_steps = 5
         # actor_model_config.chunk_size = 5
@@ -394,8 +402,10 @@ def get_model(cfg: DictConfig, override_config_kwargs=None):
             model.freeze_vlm()
 
         ckpt_path = "/home/bao_zonghuang/.cache/huggingface/hub/models--HuggingFaceVLA--smolvla_libero/snapshots/6721902bc4d61e50a3bfdb11dfb4cb626f05d102"
+        # ckpt_path = "/home/bao_zonghuang/.cache/huggingface/hub/models--lerobot--smolvla_libero/snapshots/31d453f7edd78c839a8bbc39744a292686daf0de"
+        # ckpt_path = "/home/bao_zonghuang/codes/python/RLinf/logs/20260430-12:33:13/test_smolvla/checkpoints/global_step_20/actor/model"
         weight_path = os.path.join(ckpt_path, "model.safetensors")
-        # safetensors.torch.load_model(model, weight_path, strict=False)
+        # weight_path = os.path.join(ckpt_path, "model-00001-of-00001.safetensors")
         
         # logger.info(f"SmolVLA model keys: {model.state_dict().keys()}")
         # logger.info(f"ckpt keys: {safetensors.torch.load_file(weight_path).keys()}")
@@ -404,19 +414,20 @@ def get_model(cfg: DictConfig, override_config_kwargs=None):
         new_ckpt = OrderedDict()
         mismatched_keys = []
         prefix = "model."
+        # prefix = ""
         for k, t in ckpt.items():
             new_k = k[len(prefix):] if k.startswith(prefix) else k
+            # new_k = k
             if new_k in model_dict:
                 new_ckpt[new_k] = t.clone()  # clone 以防后续 in-place
             else:
-                # 如果你想追踪未匹配的 ckpt key，可以打印或收集
                 mismatched_keys.append(new_k)
         if len(mismatched_keys) > 0:
-            pass
-            # logger.warning(f"以下 ckpt keys 未匹配到模型参数: {mismatched_keys}")
+            # pass
+            logger.warning(f"以下 ckpt keys 未匹配到模型参数: {mismatched_keys}")
         res = model.load_state_dict(new_ckpt, strict=False)
-        # logger.info(f"SmolVLA load_state_dict result: {res}")
-
+        logger.info(f"SmolVLA load_state_dict result: {res}")
+        # logger.info(f"SmolVLA dtype: {list(model.vlm_with_expert.parameters())[0].dtype}, device: {next(model.parameters()).device}")
         model.to(torch_dtype)
     else:
         return None
@@ -457,6 +468,12 @@ def get_model(cfg: DictConfig, override_config_kwargs=None):
                 tag_vlm_subtree(model, False)
                 tag_vlm_subtree(module_to_lora, True)
                 model.paligemma_with_expert.paligemma = module_to_lora
+            elif model_type == SupportedModel.SMOLVLA:
+                module_to_lora = model.vlm_with_expert.vlm
+                module_to_lora = get_peft_model(module_to_lora, lora_config)
+                tag_vlm_subtree(model, False)
+                tag_vlm_subtree(module_to_lora, True)
+                model.vlm_with_expert.vlm = module_to_lora
             else:
                 model = get_peft_model(model, lora_config)
         else:

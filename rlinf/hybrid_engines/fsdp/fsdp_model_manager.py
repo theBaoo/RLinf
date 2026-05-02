@@ -231,6 +231,31 @@ class FSDPModelManager:
         except Exception as e:
             self._logger.warning(f"[FSDP] Liger kernels not applied: {e}")
 
+    def _ensure_uniform_param_dtype(
+        self, module: torch.nn.Module, target_dtype: torch.dtype
+    ) -> torch.nn.Module:
+        """
+        Ensure all model parameters use a uniform dtype before FSDP flattening.
+
+        Args:
+            module: The model module to cast.
+            target_dtype: The dtype to cast all parameters to.
+
+        Returns:
+            The module with parameters cast to target_dtype when needed.
+        """
+        param_dtypes = {p.dtype for p in module.parameters()}
+        if not param_dtypes:
+            return module
+        if len(param_dtypes) > 1 or target_dtype not in param_dtypes:
+            self._logger.warning(
+                "[FSDP] Detected mixed parameter dtypes %s; casting to %s before FSDP wrap.",
+                sorted({str(d) for d in param_dtypes}),
+                target_dtype,
+            )
+            module = module.to(dtype=target_dtype)
+        return module
+
     def setup_model_and_optimizer(self) -> None:
         """Setup model, lr_scheduler, optimizer and grad_scaler."""
         module = self.model_provider_func()
@@ -241,6 +266,17 @@ class FSDPModelManager:
             module.gradient_checkpointing_enable()
         else:
             self._logger.info("[FSDP] Gradient checkpointing is disabled")
+
+        # Ensure model parameters share a uniform dtype before FSDP flattening.
+        # This avoids FSDP errors when some params are bf16 while others are fp32.
+        if not self._cfg.model.get("gptq_model", False) and not self._cfg.model.get(
+            "load_in_8bit", False
+        ):
+            target_dtype = torch_dtype_from_precision(
+                self._cfg.fsdp_config.mixed_precision.param_dtype
+            )
+            if target_dtype is not None:
+                module = self._ensure_uniform_param_dtype(module, target_dtype)
 
         # build model, optimizer, lr_scheduler, grad_scaler
         self.model = self._strategy.wrap_model(

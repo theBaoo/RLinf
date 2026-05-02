@@ -78,10 +78,28 @@ def compute_gae_advantages_and_returns(
 
     advantages = returns - values[:-1] if not critic_free else returns
 
+    if kwargs.get("debug_adv_stats", False):
+        returns_mean = returns.detach().float().mean().item()
+        values_mean = (
+            values.detach().float().mean().item() if values is not None else float("nan")
+        )
+        adv_mean_before_norm = advantages.detach().float().mean().item()
+
     if normalize_advantages:
         advantages = safe_normalize(advantages, loss_mask=loss_mask)
     if normalize_returns:
         returns = safe_normalize(returns, loss_mask=loss_mask)
+
+    if kwargs.get("debug_adv_stats", False):
+        adv_mean_after_norm = advantages.detach().float().mean().item()
+        print(
+            "[DBG-ADV] "
+            f"returns_mean={returns_mean:.6g} | "
+            f"values_mean={values_mean:.6g} | "
+            f"adv_mean_before_norm={adv_mean_before_norm:.6g} | "
+            f"adv_mean_after_norm={adv_mean_after_norm:.6g} | "
+            f"normalize_advantages={normalize_advantages}"
+        )
 
     return advantages, returns
 

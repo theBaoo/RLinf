@@ -547,8 +547,96 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         self.channel = self.connect_channel(cfg.actor.channel.name)
 
+        # Optional: reserve CUDA memory while actor is idle/waiting for rollouts.
+        self._idle_reserve_tensor = None
+        self._idle_reserve_bytes = int(
+            float(self.cfg.actor.get("idle_reserve_cuda_gb", 0.0)) * (1024**3)
+        )
+        self._idle_reserve_margin_bytes = int(
+            float(self.cfg.actor.get("idle_reserve_cuda_margin_gb", 1.0)) * (1024**3)
+        )
+
+    def _is_lora_debug_enabled(self) -> bool:
+        return bool(
+            self.cfg.actor.model.get("is_lora", False)
+            and self.cfg.actor.get("debug_lora", False)
+        )
+
+    def _get_lora_named_params(self):
+        for name, param in self.model.named_parameters():
+            if "lora_" in name:
+                yield name, param
+
+    def _log_lora_param_overview(self):
+        if not self._is_lora_debug_enabled() or self._rank != 0:
+            return
+
+        total_params = 0
+        trainable_params = 0
+        lora_total_params = 0
+        lora_trainable_params = 0
+        lora_module_names = []
+
+        for name, p in self.model.named_parameters():
+            numel = p.numel()
+            total_params += numel
+            if p.requires_grad:
+                trainable_params += numel
+            if "lora_" in name:
+                lora_total_params += numel
+                if p.requires_grad:
+                    lora_trainable_params += numel
+                if len(lora_module_names) < 8:
+                    lora_module_names.append(name)
+
+        self.log_info(
+            "[DBG-LORA-INIT] "
+            f"lora_total={lora_total_params} | "
+            f"lora_trainable={lora_trainable_params} | "
+            f"trainable_total={trainable_params} | "
+            f"model_total={total_params}"
+        )
+        if lora_module_names:
+            self.log_info("[DBG-LORA-INIT] sample_lora_params=" + ", ".join(lora_module_names))
+
+    def _collect_lora_grad_weight_stats(self) -> dict[str, float]:
+        grad_sq_sum = 0.0
+        weight_sq_sum = 0.0
+        grad_numel = 0
+        weight_numel = 0
+        missing_grad = 0
+        total_lora_tensors = 0
+
+        for _, p in self._get_lora_named_params():
+            total_lora_tensors += 1
+            if p.requires_grad:
+                p_detached = p.detach().float()
+                weight_sq_sum += torch.sum(p_detached * p_detached).item()
+                weight_numel += p_detached.numel()
+                if p.grad is None:
+                    missing_grad += 1
+                else:
+                    g = p.grad.detach().float()
+                    grad_sq_sum += torch.sum(g * g).item()
+                    grad_numel += g.numel()
+
+        grad_l2 = grad_sq_sum**0.5
+        weight_l2 = weight_sq_sum**0.5
+        grad_rms = (grad_sq_sum / max(grad_numel, 1)) ** 0.5
+        weight_rms = (weight_sq_sum / max(weight_numel, 1)) ** 0.5
+
+        return {
+            "lora/grad_l2": grad_l2,
+            "lora/weight_l2": weight_l2,
+            "lora/grad_rms": grad_rms,
+            "lora/weight_rms": weight_rms,
+            "lora/missing_grad_tensors": float(missing_grad),
+            "lora/total_lora_tensors": float(total_lora_tensors),
+        }
+
     def init_worker(self):
         self.setup_model_and_optimizer()
+        self._log_lora_param_overview()
 
         if self.cfg.actor.get("enable_offload", False):
             self.offload_param_and_grad()
@@ -581,6 +669,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         """
         Receive rollout batch from rollout workers.
         """
+        self._reserve_idle_cuda_memory_if_needed()
+
         send_num = self._component_placement.get_world_size("rollout") * self.stage_num
         recv_num = self._component_placement.get_world_size("actor")
         split_num = compute_split_num(send_num, recv_num)
@@ -601,6 +691,49 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             )
 
         self.rollout_batch = self._process_received_rollout_batch(self.rollout_batch)
+
+    def _reserve_idle_cuda_memory_if_needed(self):
+        if self._idle_reserve_bytes <= 0:
+            return
+        if self._idle_reserve_tensor is not None:
+            return
+
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info(self.device)
+            target_bytes = min(
+                self._idle_reserve_bytes,
+                max(0, int(free_bytes) - self._idle_reserve_margin_bytes),
+            )
+            if target_bytes <= 0:
+                self.log_info(
+                    f"[idle-reserve] skip reserve on rank {self._rank}: "
+                    f"free={free_bytes / (1024**3):.2f} GiB, "
+                    f"margin={self._idle_reserve_margin_bytes / (1024**3):.2f} GiB"
+                )
+                return
+
+            self._idle_reserve_tensor = torch.empty(
+                target_bytes, dtype=torch.uint8, device=self.device
+            )
+            self.log_info(
+                f"[idle-reserve] reserved {target_bytes / (1024**3):.2f} GiB "
+                f"on rank {self._rank}"
+            )
+        except RuntimeError as e:
+            self._idle_reserve_tensor = None
+            self.log_info(f"[idle-reserve] reserve failed on rank {self._rank}: {e}")
+
+    def _release_idle_cuda_memory_if_needed(self):
+        if self._idle_reserve_tensor is None:
+            return
+        reserved_bytes = self._idle_reserve_tensor.numel()
+        del self._idle_reserve_tensor
+        self._idle_reserve_tensor = None
+        torch.cuda.empty_cache()
+        self.log_info(
+            f"[idle-reserve] released {reserved_bytes / (1024**3):.2f} GiB "
+            f"on rank {self._rank}"
+        )
 
     def _process_received_rollout_batch(
         self, rollout_batch: dict[str, torch.Tensor]
@@ -704,6 +837,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "reward_type": self.cfg.algorithm.reward_type,
             "loss_mask": self.rollout_batch.get("loss_mask", None),
             "loss_mask_sum": self.rollout_batch.get("loss_mask_sum", None),
+            "debug_adv_stats": self._rank == 0,
         }
 
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
@@ -718,9 +852,60 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         return rollout_metrics
 
     def run_training(self):
+        self._release_idle_cuda_memory_if_needed()
+
         if self.cfg.actor.get("enable_offload", False):
             self.load_param_and_grad(self.device)
             self.load_optimizer(self.device)
+
+        def _brief_tensor_stats(name: str, t: torch.Tensor | None) -> str:
+            if t is None:
+                return f"{name}=None"
+            x = t.detach()
+            shape = tuple(x.shape)
+            if x.numel() == 0:
+                return f"{name}.shape={shape},numel=0"
+            if not x.is_floating_point():
+                return f"{name}.shape={shape},dtype={x.dtype}"
+            xf = x.float().reshape(-1)
+            finite = torch.isfinite(xf)
+            if finite.any():
+                xv = xf[finite]
+                return (
+                    f"{name}.shape={shape},mean={xv.mean().item():.6g},"
+                    f"std={xv.std().item():.6g},min={xv.min().item():.6g},max={xv.max().item():.6g},"
+                    f"finite_ratio={finite.float().mean().item():.6g}"
+                )
+            return f"{name}.shape={shape},finite_ratio=0"
+
+        def _expand_mask_to(x: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor | None:
+            if mask is None:
+                return None
+            m = mask.detach()
+            if m.dtype != torch.bool:
+                m = m > 0
+            while m.ndim < x.ndim:
+                m = m.unsqueeze(-1)
+            try:
+                m = m.expand_as(x)
+            except RuntimeError:
+                return None
+            return m
+
+        def _masked_mean_std(x: torch.Tensor, mask: torch.Tensor | None) -> tuple[float, float]:
+            xf = x.detach().float().reshape(-1)
+            finite = torch.isfinite(xf)
+            if mask is not None:
+                mf = mask.detach().reshape(-1)
+                valid = finite & mf
+            else:
+                valid = finite
+            if not valid.any():
+                return float("nan"), float("nan")
+            xv = xf[valid]
+            mean = xv.mean().item()
+            std = xv.std().item() if xv.numel() > 1 else 0.0
+            return mean, std
 
         self.model.train()
         rollout_size = (
@@ -826,10 +1011,44 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             use_cache=False,
                         )
 
+                    # PPO debug stats for policy update stability.
+                    logprobs_dbg = output_dict["logprobs"].detach().float()
+                    old_logprobs_dbg = prev_logprobs.detach().float()
+                    adv_dbg = advantages.detach().float()
+                    old_minus_new_dbg = old_logprobs_dbg - logprobs_dbg
+                    ratio_dbg = torch.exp(logprobs_dbg - old_logprobs_dbg)
+
+                    lp_mask = _expand_mask_to(logprobs_dbg, loss_mask)
+                    adv_mask = _expand_mask_to(adv_dbg, loss_mask)
+                    ratio_mask = _expand_mask_to(ratio_dbg, loss_mask)
+
+                    logprob_mean, logprob_std = _masked_mean_std(logprobs_dbg, lp_mask)
+                    old_minus_new_mean, old_minus_new_std = _masked_mean_std(
+                        old_minus_new_dbg, lp_mask
+                    )
+                    _, advantage_std = _masked_mean_std(adv_dbg, adv_mask)
+                    ratio_mean, ratio_std = _masked_mean_std(ratio_dbg, ratio_mask)
+
+                    # after output_dict is computed and before kwargs = {...}
+                    if idx == 0 and self._rank == 0:
+                        pass
+
                     if SupportedModel(self.cfg.actor.model.model_type) in [
                         SupportedModel.GR00T
                     ]:
                         prev_logprobs = output_dict["prev_logprobs"]
+
+                    # Fail fast when value path is unexpectedly missing in GAE mode.
+                    if compute_values:
+                        if returns is None or prev_values is None:
+                            raise ValueError(
+                                "GAE mode expects non-None returns and prev_values, "
+                                f"got returns={returns is not None}, prev_values={prev_values is not None}"
+                            )
+                        if output_dict.get("values", None) is None:
+                            raise ValueError(
+                                "GAE mode expects model output to contain 'values', but got None"
+                            )
 
                     kwargs = {
                         "loss_type": self.cfg.algorithm.loss_type,
@@ -853,7 +1072,38 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         "critic_warmup": self.optimizer_steps
                         < self.critic_warmup_steps,
                     }
+
+                    if idx == 0 and self._rank == 0:
+                        pass
+                        # self.log_info(
+                        #     "[DBG-VH-DATA] "
+                        #     + _brief_tensor_stats("returns", returns)
+                        #     + " | "
+                        #     + _brief_tensor_stats("prev_values", prev_values)
+                        #     + " | "
+                        #     + _brief_tensor_stats("values", output_dict.get("values", None))
+                        #     + " | "
+                        #     + _brief_tensor_stats("loss_mask", loss_mask)
+                        # )
+
                     loss, metrics_data = policy_loss(**kwargs)
+
+                    metrics_data["debug/logprob_mean"] = logprob_mean
+                    metrics_data["debug/logprob_std"] = logprob_std
+                    metrics_data["debug/old_minus_logprob_mean"] = old_minus_new_mean
+                    metrics_data["debug/old_minus_logprob_std"] = old_minus_new_std
+                    metrics_data["debug/advantage_std"] = advantage_std
+                    metrics_data["debug/ratio_mean"] = ratio_mean
+                    metrics_data["debug/ratio_std"] = ratio_std
+
+                    metrics_data["critic/warmup_flag"] = float(kwargs["critic_warmup"])
+                    metrics_data["critic/compute_values_flag"] = float(compute_values)
+                    if returns is not None and prev_values is not None:
+                        td_old = (returns - prev_values).detach().float()
+                        metrics_data["critic/td_old_abs_mean"] = td_old.abs().mean().item()
+                    if returns is not None and output_dict.get("values", None) is not None:
+                        td_new = (returns - output_dict["values"]).detach().float()
+                        metrics_data["critic/td_new_abs_mean"] = td_new.abs().mean().item()
 
                     entropy_loss = torch.tensor(0.0, device=torch.cuda.current_device())
                     if (
@@ -879,6 +1129,27 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     append_to_dict(metrics, metrics_data)
 
                 torch.cuda.empty_cache()
+
+                if self._is_lora_debug_enabled():
+                    lora_debug_interval = int(self.cfg.actor.get("debug_lora_interval", 20))
+                    should_log_lora = (
+                        self._rank == 0
+                        and lora_debug_interval > 0
+                        and (self.optimizer_steps % lora_debug_interval == 0)
+                    )
+                    if should_log_lora:
+                        lora_stats = self._collect_lora_grad_weight_stats()
+                        self.log_info(
+                            "[DBG-LORA-TRAIN] "
+                            f"step={self.optimizer_steps} | "
+                            f"grad_l2={lora_stats['lora/grad_l2']:.6g} | "
+                            f"grad_rms={lora_stats['lora/grad_rms']:.6g} | "
+                            f"weight_l2={lora_stats['lora/weight_l2']:.6g} | "
+                            f"weight_rms={lora_stats['lora/weight_rms']:.6g} | "
+                            f"missing_grad={int(lora_stats['lora/missing_grad_tensors'])}/"
+                            f"{int(lora_stats['lora/total_lora_tensors'])}"
+                        )
+                        append_to_dict(metrics, lora_stats)
 
                 grad_norm, lr_list = self.optimizer_step()
                 data = {

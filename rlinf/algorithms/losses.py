@@ -196,12 +196,19 @@ def compute_ppo_critic_loss(
         masked_returns = returns
         masked_values = values
 
+    # from rlinf.utils.logging import get_logger
+    # logger = get_logger()
+    # logger.info(f"returns: {returns}")
+    # logger.info(f"loss_mask: {loss_mask}")
+    # logger.info(f"masked_returns: {masked_returns}")
     var_returns = torch.var(masked_returns)
     if torch.isnan(var_returns) or var_returns == 0:
+        # logger.info(f"torch.isnan(var_returns): {torch.isnan(var_returns)}; var_returns: {var_returns}")
         explained_variance = torch.tensor(float("nan"), device=returns.device)
     else:
         var_diff = torch.var(masked_returns - masked_values)
         if torch.isnan(var_diff):
+            # logger.info(f"torch.isnan(var_diff): {torch.isnan(var_diff)}; var_diff: {var_diff}")
             explained_variance = torch.tensor(float("nan"), device=returns.device)
         else:
             explained_variance = 1 - var_diff / var_returns

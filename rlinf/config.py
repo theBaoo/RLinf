@@ -337,6 +337,7 @@ def validate_fsdp_cfg(cfg: DictConfig, resume_dir: Optional[str] = None) -> Dict
         )
 
         if resume_dir is not None:
+            # why?
             cfg.fsdp_config.use_orig_params = True
 
         assert cfg.fsdp_config.backward_prefetch in [
